@@ -90,6 +90,9 @@ async def log_requests(request: Request, call_next):
         print(f"{'='*80}\n")
         raise
 
+@app.get("/")
+def health_check() -> Dict[str, str]:
+    return {"status": "ok"}
 
 @app.get("/health")
 def health() -> Dict[str, str]:
