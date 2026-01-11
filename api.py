@@ -106,9 +106,21 @@ def stream_status() -> Dict[str, Any]:
     if p is None:
         return {"status": "not_initialized", "running": False}
 
+    def _is_open(h) -> bool:
+        if h is None:
+            return False
+        try:
+            return h.isOpened()
+        except Exception:
+            return False
+
     return {
         "status": "initialized",
-        "running": (p._plate_thread is not None and p._plate_thread.is_alive()),
+        "running": (p._plate_thread is not None and p._plate_thread.is_alive()
+                    and p._snow_thread is not None and p._snow_thread.is_alive()
+                    and p._worker_thread is not None and p._worker_thread.is_alive()),
+        "plate_connected": _is_open(p.plate_cap),
+        "snow_connected": _is_open(p.snow_cap),
         "snow_buffer_size": len(p._snow_frame_buffer),
         "use_ffmpeg_direct": p.use_ffmpeg_direct,
     }

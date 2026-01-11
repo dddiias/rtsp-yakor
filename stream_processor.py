@@ -133,6 +133,10 @@ USE_FFMPEG_DIRECT = os.getenv("USE_FFMPEG_DIRECT", "false").strip().lower() == "
 
 FFMPEG_BIN_ENV = os.getenv("FFMPEG_BIN", "").strip()
 
+RECONNECT_BASE_DELAY_S = float(os.getenv("RECONNECT_BASE_DELAY_S", "30.0"))   # стартовая пауза
+RECONNECT_MAX_DELAY_S  = float(os.getenv("RECONNECT_MAX_DELAY_S", "600.0"))  # потолок паузы
+NO_FRAME_RECONNECT_THRESHOLD = int(os.getenv("NO_FRAME_RECONNECT_THRESHOLD", "1500"))
+
 print(f"[STREAM] Plate camera line: ({PLATE_LINE_X1:.3f},{PLATE_LINE_Y1:.3f})-({PLATE_LINE_X2:.3f},{PLATE_LINE_Y2:.3f}), dir={PLATE_LINE_DIRECTION}")
 print(f"[STREAM] Snow camera line:  ({SNOW_LINE_X1:.3f},{SNOW_LINE_Y1:.3f})-({SNOW_LINE_X2:.3f},{SNOW_LINE_Y2:.3f}), dir={SNOW_LINE_DIRECTION}")
 print(f"[STREAM] USE_FFMPEG_DIRECT={USE_FFMPEG_DIRECT}, FFMPEG_OUT={FFMPEG_OUT_W}x{FFMPEG_OUT_H}")
@@ -865,33 +869,55 @@ class StreamProcessor:
 
     def _snow_processing_loop(self) -> None:
         print("[STREAM] Starting snow stream processing...")
-        self.snow_cap = self._open_rtsp(SNOW_CAMERA_RTSP, "Snow Camera", retries=5)
-        if self.snow_cap is None:
-            print("[STREAM] ERROR: Cannot open snow camera")
-            return
 
+        delay = RECONNECT_BASE_DELAY_S
         fail = 0
         frame_counter = 0
 
         while not self._stop_event.is_set():
+            # 1) гарантируем, что соединение есть
+            if self.snow_cap is None:
+                cap = self._open_rtsp(SNOW_CAMERA_RTSP, "Snow Camera", retries=5)
+                if cap is None:
+                    print(f"[STREAM] Snow camera unavailable, retry in {delay:.1f}s...")
+                    time.sleep(delay)
+                    delay = min(RECONNECT_MAX_DELAY_S, max(RECONNECT_BASE_DELAY_S, delay * 1.6))
+                    continue
+
+                self.snow_cap = cap
+                delay = RECONNECT_BASE_DELAY_S
+                fail = 0
+                frame_counter = 0
+
+            # 2) проверяем “жив ли” handle
             opened = self.snow_cap.isOpened() if not isinstance(self.snow_cap, FFmpegRTSPReader) else self.snow_cap.isOpened()
             if not opened:
                 print("[STREAM] Snow stream closed, reconnecting...")
                 self._close_handle(self.snow_cap)
-                time.sleep(2)
-                self.snow_cap = self._open_rtsp(SNOW_CAMERA_RTSP, "Snow Camera", retries=5)
-                if self.snow_cap is None:
-                    time.sleep(2)
-                    continue
+                self.snow_cap = None
+                time.sleep(0.5)
+                continue
 
+            # 3) читаем кадр
             ret, frame = self._read_frame(self.snow_cap)
             if not ret or frame is None or not self._validate_frame(frame):
                 fail += 1
                 if fail % 20 == 0:
                     print(f"[STREAM] Snow: {fail} failed reads...")
+
+                # ключевое: если долго нет кадров -> перезапуск соединения
+                if fail >= NO_FRAME_RECONNECT_THRESHOLD:
+                    print("[STREAM] Snow: too many no-frame reads, forcing reconnect...")
+                    self._close_handle(self.snow_cap)
+                    self.snow_cap = None
+                    fail = 0
+                    time.sleep(0.5)
+                    continue
+
                 time.sleep(0.02)
                 continue
 
+            # 4) кадр ок
             fail = 0
             now_ts = time.time()
 
@@ -917,37 +943,61 @@ class StreamProcessor:
             time.sleep(0.005)
 
         self._close_handle(self.snow_cap)
+        self.snow_cap = None
         print("[STREAM] Snow processing loop stopped")
+
 
     def _plate_processing_loop(self) -> None:
         print("[STREAM] Starting plate stream processing...")
-        self.plate_cap = self._open_rtsp(PLATE_CAMERA_RTSP, "Plate Camera", retries=5)
-        if self.plate_cap is None:
-            print("[STREAM] ERROR: Cannot open plate camera")
-            return
 
+        delay = RECONNECT_BASE_DELAY_S
         fail = 0
         frame_counter = 0
 
         while not self._stop_event.is_set():
+            # 1) гарантируем, что соединение есть
+            if self.plate_cap is None:
+                cap = self._open_rtsp(PLATE_CAMERA_RTSP, "Plate Camera", retries=5)
+                if cap is None:
+                    print(f"[STREAM] Plate camera unavailable, retry in {delay:.1f}s...")
+                    time.sleep(delay)
+                    delay = min(RECONNECT_MAX_DELAY_S, max(RECONNECT_BASE_DELAY_S, delay * 1.6))
+                    continue
+
+                self.plate_cap = cap
+                delay = RECONNECT_BASE_DELAY_S
+                fail = 0
+                frame_counter = 0
+
+            # 2) проверяем “жив ли” handle
             opened = self.plate_cap.isOpened() if not isinstance(self.plate_cap, FFmpegRTSPReader) else self.plate_cap.isOpened()
             if not opened:
                 print("[STREAM] Plate stream closed, reconnecting...")
                 self._close_handle(self.plate_cap)
-                time.sleep(2)
-                self.plate_cap = self._open_rtsp(PLATE_CAMERA_RTSP, "Plate Camera", retries=5)
-                if self.plate_cap is None:
-                    time.sleep(2)
-                    continue
+                self.plate_cap = None
+                time.sleep(0.5)
+                continue
 
+            # 3) читаем кадр
             ret, frame = self._read_frame(self.plate_cap)
             if not ret or frame is None or not self._validate_frame(frame):
                 fail += 1
                 if fail % 20 == 0:
                     print(f"[STREAM] Plate: {fail} failed reads...")
+
+                # если долго нет кадров -> перезапуск соединения
+                if fail >= NO_FRAME_RECONNECT_THRESHOLD:
+                    print("[STREAM] Plate: too many no-frame reads, forcing reconnect...")
+                    self._close_handle(self.plate_cap)
+                    self.plate_cap = None
+                    fail = 0
+                    time.sleep(0.5)
+                    continue
+
                 time.sleep(0.02)
                 continue
 
+            # 4) кадр ок
             fail = 0
             frame_counter += 1
 
@@ -962,6 +1012,7 @@ class StreamProcessor:
             time.sleep(0.005)
 
         self._close_handle(self.plate_cap)
+        self.plate_cap = None
         print("[STREAM] Plate processing loop stopped")
 
     # --------- Public API ---------
