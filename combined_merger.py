@@ -5,6 +5,7 @@ import os
 import time
 import json
 import hashlib
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -33,6 +34,7 @@ class EventMerger:
         self.ttl_seconds = ttl_seconds
 
         self._gemini_client: genai.Client | None = None
+        self._gemini_client_async = None  # Async client
         self._gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -47,6 +49,15 @@ class EventMerger:
                 raise RuntimeError("GEMINI_API_KEY is not set")
             self._gemini_client = genai.Client(api_key=self._gemini_api_key)
         return self._gemini_client
+
+    def _get_gemini_client_async(self):
+        """Получает async клиент Gemini."""
+        if self._gemini_client_async is None:
+            if not self._gemini_api_key:
+                raise RuntimeError("GEMINI_API_KEY is not set")
+            client = genai.Client(api_key=self._gemini_api_key)
+            self._gemini_client_async = client.aio
+        return self._gemini_client_async
 
     @staticmethod
     def _photos_hash(snow_photo: bytes, plate_photo_1: bytes, plate_photo_2: bytes | None) -> str:
@@ -140,11 +151,37 @@ class EventMerger:
             "}\n"
         )
 
-        client = self._get_gemini_client()
-        resp = client.models.generate_content(
-            model=self._gemini_model,
-            contents=images + [prompt],
-        )
+        # Используем async клиент Gemini
+        aclient = self._get_gemini_client_async()
+        # Добавляем таймаут 30 секунд для запроса Gemini
+        try:
+            resp = await asyncio.wait_for(
+                aclient.models.generate_content(
+                    model=self._gemini_model,
+                    contents=images + [prompt],
+                ),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            result = {
+                "error": "Gemini request timeout (30s)",
+                "snow_percentage": 0.0,
+                "snow_confidence": 0.0,
+                "plate": None,
+                "plate_confidence": 0.0,
+            }
+            self._gemini_cache[ph] = (dict(result), now_ts)
+            return result
+        except Exception as e:
+            result = {
+                "error": f"Gemini request error: {e}",
+                "snow_percentage": 0.0,
+                "snow_confidence": 0.0,
+                "plate": None,
+                "plate_confidence": 0.0,
+            }
+            self._gemini_cache[ph] = (dict(result), now_ts)
+            return result
 
         text = (resp.text or "").strip()
         if not text:
