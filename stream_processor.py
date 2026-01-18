@@ -421,16 +421,32 @@ class FFmpegRTSPReader:
                 creationflags = 0
 
         try:
+            # ВРЕМЕННО: логируем stderr для диагностики на сервере
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,  # Изменили с DEVNULL на PIPE для диагностики
                 bufsize=self.frame_size * 4,
                 creationflags=creationflags,
             )
             if self.process.stdout is None:
                 self.release()
                 return False
+
+            # Запускаем поток для чтения stderr (чтобы видеть ошибки FFMPEG)
+            def _read_stderr():
+                if self.process and self.process.stderr:
+                    try:
+                        for line in iter(self.process.stderr.readline, b''):
+                            if line:
+                                msg = line.decode('utf-8', errors='ignore').strip()
+                                if msg:  # Логируем только непустые сообщения
+                                    print(f"[FFMPEG:{self.name}] stderr: {msg}")
+                    except Exception as e:
+                        print(f"[FFMPEG:{self.name}] stderr reader error: {e}")
+
+            stderr_thread = threading.Thread(target=_read_stderr, daemon=True, name=f"ffmpeg-stderr-{self.name}")
+            stderr_thread.start()
 
             self._stop.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True, name=f"ffmpeg-reader-{self.name}")
@@ -450,6 +466,9 @@ class FFmpegRTSPReader:
 
         while not self._stop.is_set():
             if self.process.poll() is not None:
+                # Процесс упал - логируем
+                returncode = self.process.returncode
+                print(f"[FFMPEG:{self.name}] process exited with code {returncode}")
                 break
 
             buf = bytearray(need)
@@ -533,7 +552,10 @@ def _mask_url(rtsp_url: str) -> str:
 
 
 def _backoff_sleep(attempt: int) -> None:
-    t = min(RECONNECT_MAX_S, RECONNECT_MIN_S * (1.6 ** attempt))
+    # Ограничиваем attempt, чтобы избежать переполнения
+    max_attempt = 50  # 1.6^50 уже очень большое число
+    safe_attempt = min(attempt, max_attempt)
+    t = min(RECONNECT_MAX_S, RECONNECT_MIN_S * (1.6 ** safe_attempt))
     time.sleep(t)
 
 
@@ -677,12 +699,27 @@ class StreamProcessor:
         for attempt in range(1, retries + 1):
             reader = FFmpegRTSPReader(rtsp_url, name=name.replace(" ", "_").lower())
             if reader.start():
-                ok, fr = reader.read(timeout_s=3.0)
+                # Увеличиваем таймаут для первого чтения (RTSP может долго подключаться на сервере)
+                ok, fr = reader.read(timeout_s=15.0)  # Увеличено с 3.0 до 15.0 для медленного соединения
                 if ok and fr is not None and fr.size > 0:
                     hh, ww = fr.shape[:2]
                     print(f"[STREAM] ✓ {name} OK: {ww}x{hh}")
                     return reader
                 print(f"[STREAM] ⚠ {name}: started but no frames (attempt {attempt})")
+                # Проверяем, не упал ли процесс FFMPEG
+                if reader.process and reader.process.poll() is not None:
+                    returncode = reader.process.returncode
+                    print(f"[STREAM] ⚠ {name}: FFMPEG process exited with code {returncode}")
+                    # Пытаемся прочитать последние строки stderr
+                    if reader.process.stderr:
+                        try:
+                            stderr_lines = reader.process.stderr.readlines()
+                            if stderr_lines:
+                                print(f"[STREAM] ⚠ {name}: Last FFMPEG errors:")
+                                for line in stderr_lines[-5:]:  # Последние 5 строк
+                                    print(f"  {line.decode('utf-8', errors='ignore').strip()}")
+                        except Exception:
+                            pass
                 reader.release()
             time.sleep(1.0 * attempt)
 
