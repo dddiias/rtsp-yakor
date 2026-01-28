@@ -137,7 +137,7 @@ class EventMerger:
         client = self._get_gemini_client()
         resp = client.models.generate_content(
             model=self._gemini_model,
-            contents=images + [prompt],
+            contents=[prompt] + images,
         )
 
         text = (resp.text or "").strip()

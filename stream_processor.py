@@ -812,11 +812,38 @@ class StreamProcessor:
             return self._task_queue.popleft()
 
     # ---------- worker ----------
-    async def _process_crossing_async(self, plate_frame: np.ndarray, cross_ts: float, client: httpx.AsyncClient) -> None:
+    async def _process_crossing_async(self, task: dict, client: httpx.AsyncClient) -> None:
+
+        plate_frame = task.get("plate_frame")
+        cross_ts = float(task.get("cross_ts", 0.0) or 0.0)
+        if plate_frame is None or cross_ts <= 0:
+            return
+
         snow_frame = self._get_best_snow_frame(cross_ts)
         if snow_frame is None:
             print("[STREAM] No snow frame near crossing time, skipping")
             return
+
+            # ✅ 1) crop truck area (чтобы номер стал крупнее)
+        bbox = task.get("truck_bbox") if isinstance(task, dict) else None
+        if bbox and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            x1, y1, x2, y2 = map(int, bbox)
+
+            h, w = plate_frame.shape[:2]
+            # небольшой паддинг вокруг грузовика
+            pad = int(0.08 * max(x2 - x1, y2 - y1))
+            x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
+            x2 = min(w, x2 + pad); y2 = min(h, y2 + pad)
+
+            # защита от мусорных bbox
+            if (x2 - x1) > 10 and (y2 - y1) > 10:
+                plate_frame = plate_frame[y1:y2, x1:x2]
+
+                # ✅ 2) апскейл кропа (важно для OCR)
+                plate_frame = cv2.resize(
+                    plate_frame, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC
+                )
+
 
         plate_bytes = self._encode_jpeg(plate_frame)
         snow_bytes = self._encode_jpeg(snow_frame)
@@ -908,7 +935,7 @@ class StreamProcessor:
                     continue
 
                 try:
-                    loop.run_until_complete(self._process_crossing_async(plate_frame, cross_ts, client))
+                    loop.run_until_complete(self._process_crossing_async(task, client))
                 except Exception as e:
                     print(f"[STREAM] Worker error: {e}")
         finally:
@@ -1017,7 +1044,11 @@ class StreamProcessor:
                     cross_ts = now
                     for tr in crossed_tracks:
                         print(f"[STREAM] CROSS ✅ track_id={tr.track_id} bbox={tr.bbox}")
-                        self._push_task({"plate_frame": frame.copy(), "cross_ts": cross_ts})
+                        self._push_task({
+                            "plate_frame": frame.copy(),
+                            "cross_ts": cross_ts,
+                            "truck_bbox": tr.bbox,   # ✅ ДОБАВИЛИ
+                        })
 
             time.sleep(PLATE_LOOP_SLEEP_S)
 
