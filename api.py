@@ -8,18 +8,35 @@ from typing import Any, Dict
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 
-# Загружаем переменные окружения из app.env
-try:
-    from dotenv import load_dotenv
+# Env loading:
+# - Local dev: load from .env / app.env if present
+# - Prod (Render): use Environment Variables only (no file lookup, no warnings)
+def _is_prod_env() -> bool:
+    # Render sets RENDER=true in runtime
+    if os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    env = os.getenv("ENV", "").strip().lower()
+    return env in ("prod", "production")
 
-    env_path = os.path.join(os.path.dirname(__file__), "app.env")
-    if os.path.exists(env_path):
-        load_dotenv(env_path, override=False)
-        print(f"[API] Loaded environment from: {env_path}")
-    else:
-        print(f"[API] WARNING: app.env not found at {env_path}, using system env vars")
-except ImportError:
-    print("[API] WARNING: python-dotenv not installed, using system env vars only")
+
+def _try_load_dotenv() -> None:
+    if _is_prod_env():
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    base = os.path.dirname(__file__)
+    for fname in (".env", "app.env"):
+        p = os.path.join(base, fname)
+        if os.path.exists(p):
+            load_dotenv(p, override=False)
+            print(f"[API] Loaded environment from: {p}")
+            break
+
+
+_try_load_dotenv()
 
 from combined_merger import init_merger
 

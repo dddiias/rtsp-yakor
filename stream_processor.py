@@ -29,20 +29,35 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 
 # =========================
-# 1) Env loader (app.env)
+# 1) Env loader (.env for local, env vars for prod)
 # =========================
+def _is_prod_env() -> bool:
+    # Render sets RENDER=true in runtime
+    if os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    env = os.getenv("ENV", "").strip().lower()
+    return env in ("prod", "production")
+
+
 def _load_env_vars() -> Optional[str]:
+    """
+    Local: load from .env/app.env if present.
+    Prod (Render): don't look for files; use Environment Variables only.
+    """
+    if _is_prod_env():
+        return None
     try:
         from dotenv import load_dotenv
-        env_path = os.path.join(os.path.dirname(__file__), "app.env")
-        if os.path.exists(env_path):
-            load_dotenv(env_path, override=False)
-            return env_path
-        print(f"[STREAM] WARNING: app.env not found at {env_path}, using system env vars")
-        return None
     except ImportError:
-        print("[STREAM] WARNING: python-dotenv not installed, using system env vars only")
         return None
+
+    base = os.path.dirname(__file__)
+    for fname in (".env", "app.env"):
+        p = os.path.join(base, fname)
+        if os.path.exists(p):
+            load_dotenv(p, override=False)
+            return p
+    return None
 
 
 _env_path = _load_env_vars()
@@ -198,6 +213,7 @@ class Track:
     crossed: bool
     direction: Optional[str]
     last_cross_ts: float = 0.0
+    was_intersecting: bool = False
 
 
 @dataclass
@@ -210,7 +226,14 @@ class TimestampedFrame:
 # 4) Line crossing detector (simple IOU tracker)
 # =========================
 class LineCrossingDetector:
-    def __init__(self, x1r: float, y1r: float, x2r: float, y2r: float, direction: str = "down"):
+    def __init__(
+        self,
+        x1r: float,
+        y1r: float,
+        x2r: float,
+        y2r: float,
+        direction: str = "down",
+    ):
         self.line_x1 = float(x1r)
         self.line_y1 = float(y1r)
         self.line_x2 = float(x2r)
@@ -231,8 +254,6 @@ class LineCrossingDetector:
             return 0.0
         inter = (x2_i - x1_i) * (y2_i - y1_i)
         area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-        area2 = (x2_2 - x1_2) * (y2_2 - y2_1)
-        # исправим area2 (опечатки не допускаем)
         area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
         union = area1 + area2 - inter
         return inter / union if union > 0 else 0.0
@@ -285,26 +306,30 @@ class LineCrossingDetector:
             crossed_now = False
 
             if (not tr.crossed) and (now_ts - tr.last_cross_ts >= CROSS_EVENT_COOLDOWN_S):
-                side_prev = (prev_cx - x1) * ly - (prev_cy - y1) * lx
-                side_curr = (cx - x1) * ly - (cy - y1) * lx
+                mvx = cx - prev_cx
+                mvy = cy - prev_cy
+                dir_ok = True
+                if self.direction == "down":
+                    dir_ok = mvy > 0
+                elif self.direction == "up":
+                    dir_ok = mvy < 0
+                elif self.direction == "right":
+                    dir_ok = mvx > 0
+                elif self.direction == "left":
+                    dir_ok = mvx < 0
 
-                t = ((cx - x1) * lx + (cy - y1) * ly) / seg_len_sq
-                if -0.1 <= t <= 1.1:
-                    sign_change = (side_prev == 0) or (side_curr == 0) or (side_prev * side_curr < 0)
+                # Триггер по "касанию": отрезок линии пересёк прямоугольник bbox.
+                # Используем cv2.clipLine (пересечение отрезка с прямоугольником).
+                rx = int(min(x1_det, x2_det))
+                ry = int(min(y1_det, y2_det))
+                rw = int(max(1, abs(x2_det - x1_det)))
+                rh = int(max(1, abs(y2_det - y1_det)))
+                is_intersecting = bool(cv2.clipLine((rx, ry, rw, rh), (x1, y1), (x2, y2))[0])
 
-                    mvx = cx - prev_cx
-                    mvy = cy - prev_cy
-                    dir_ok = True
-                    if self.direction == "down":
-                        dir_ok = mvy > 0
-                    elif self.direction == "up":
-                        dir_ok = mvy < 0
-                    elif self.direction == "right":
-                        dir_ok = mvx > 0
-                    elif self.direction == "left":
-                        dir_ok = mvx < 0
-
-                    crossed_now = sign_change and dir_ok
+                # Триггерим только при "входе" в пересечение, чтобы не спамить,
+                # если bbox несколько кадров лежит на линии.
+                crossed_now = (not tr.was_intersecting) and is_intersecting and dir_ok
+                tr.was_intersecting = is_intersecting
 
             tr.bbox = (x1_det, y1_det, x2_det, y2_det)
             tr.center = (cx, cy)
@@ -338,6 +363,7 @@ class LineCrossingDetector:
                 crossed=False,
                 direction=None,
                 last_cross_ts=0.0,
+                was_intersecting=False,
             )
             self.tracks[self.next_track_id] = tr
             self.next_track_id += 1
@@ -389,11 +415,16 @@ class FFmpegRTSPReader:
             print("[FFMPEG] ERROR: ffmpeg not found. Set FFMPEG_BIN or ensure ffmpeg in PATH.")
             return False
 
+        # В проде (Render) ffmpeg часто пишет H.264 decode errors в stderr, хотя поток читается дальше.
+        # По умолчанию глушим это, но можно включить диагностику флагом.
+        ffmpeg_loglevel = os.getenv("FFMPEG_LOGLEVEL", "fatal").strip() or "fatal"
+        log_ffmpeg_stderr = os.getenv("LOG_FFMPEG_STDERR", "false").strip().lower() == "true"
+
         vf = f"fps={FFMPEG_INPUT_FPS},scale={self.width}:{self.height}"
         cmd = [
             self._ffmpeg_bin,
             "-hide_banner",
-            "-loglevel", "error",
+            "-loglevel", ffmpeg_loglevel,
             "-nostats",
 
             "-rtsp_transport", "tcp",
@@ -421,11 +452,10 @@ class FFmpegRTSPReader:
                 creationflags = 0
 
         try:
-            # ВРЕМЕННО: логируем stderr для диагностики на сервере
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,  # Изменили с DEVNULL на PIPE для диагностики
+                stderr=subprocess.PIPE if log_ffmpeg_stderr else subprocess.DEVNULL,
                 bufsize=self.frame_size * 4,
                 creationflags=creationflags,
             )
@@ -433,20 +463,22 @@ class FFmpegRTSPReader:
                 self.release()
                 return False
 
-            # Запускаем поток для чтения stderr (чтобы видеть ошибки FFMPEG)
-            def _read_stderr():
-                if self.process and self.process.stderr:
-                    try:
-                        for line in iter(self.process.stderr.readline, b''):
-                            if line:
-                                msg = line.decode('utf-8', errors='ignore').strip()
-                                if msg:  # Логируем только непустые сообщения
-                                    print(f"[FFMPEG:{self.name}] stderr: {msg}")
-                    except Exception as e:
-                        print(f"[FFMPEG:{self.name}] stderr reader error: {e}")
+            if log_ffmpeg_stderr:
+                # Запускаем поток для чтения stderr (диагностика).
+                # ВНИМАНИЕ: может заспамить логами, включать только временно.
+                def _read_stderr():
+                    if self.process and self.process.stderr:
+                        try:
+                            for line in iter(self.process.stderr.readline, b""):
+                                if line:
+                                    msg = line.decode("utf-8", errors="ignore").strip()
+                                    if msg:
+                                        print(f"[FFMPEG:{self.name}] stderr: {msg}")
+                        except Exception as e:
+                            print(f"[FFMPEG:{self.name}] stderr reader error: {e}")
 
-            stderr_thread = threading.Thread(target=_read_stderr, daemon=True, name=f"ffmpeg-stderr-{self.name}")
-            stderr_thread.start()
+                stderr_thread = threading.Thread(target=_read_stderr, daemon=True, name=f"ffmpeg-stderr-{self.name}")
+                stderr_thread.start()
 
             self._stop.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True, name=f"ffmpeg-reader-{self.name}")
@@ -568,7 +600,11 @@ class StreamProcessor:
         _load_env_vars()
 
         self.detector = LineCrossingDetector(
-            PLATE_LINE_X1, PLATE_LINE_Y1, PLATE_LINE_X2, PLATE_LINE_Y2, PLATE_LINE_DIRECTION
+            PLATE_LINE_X1,
+            PLATE_LINE_Y1,
+            PLATE_LINE_X2,
+            PLATE_LINE_Y2,
+            PLATE_LINE_DIRECTION,
         )
 
         self.plate_cap: Optional[RTSPHandle] = None
