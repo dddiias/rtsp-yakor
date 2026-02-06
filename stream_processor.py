@@ -790,15 +790,23 @@ class StreamProcessor:
             print(f"[STREAM] Gemini error: {e}")
             return
 
-        plate = (gemini_result or {}).get("plate")
-        plate_conf = float((gemini_result or {}).get("plate_confidence", 0.0) or 0.0)
-
-        # Если номер не распознан — явно ставим строку "None", чтобы не было пустого значения
-        if plate:
-            plate = str(plate).strip().upper()
+        # Обрабатываем результат Gemini
+        if gemini_result and "error" not in gemini_result:
+            plate = gemini_result.get("plate")
+            plate_conf = float(gemini_result.get("plate_confidence", 0.0) or 0.0)
+            
+            # Если номер не распознан — явно ставим строку "None", чтобы не было пустого значения
+            if plate:
+                plate = str(plate).strip().upper()
+            else:
+                plate = "None"
+                plate_conf = 0.0
         else:
+            # Ошибка парсинга - используем значения по умолчанию
             plate = "None"
             plate_conf = 0.0
+            if gemini_result and "error" in gemini_result:
+                print(f"[STREAM] Gemini error: {gemini_result.get('error', 'unknown')}")
 
         # Дедупликация только для реальных номеров
         if plate != "None":
@@ -824,8 +832,8 @@ class StreamProcessor:
             "lane": 0,
             "vehicle": {},
             "plate_source": "gemini",
-            "snow_volume_percentage": float((gemini_result or {}).get("snow_percentage", 0.0) or 0.0),
-            "snow_volume_confidence": float((gemini_result or {}).get("snow_confidence", 0.0) or 0.0),
+            "snow_volume_percentage": float(gemini_result.get("snow_percentage", 0.0) or 0.0) if (gemini_result and "error" not in gemini_result) else 0.0,
+            "snow_volume_confidence": float(gemini_result.get("snow_confidence", 0.0) or 0.0) if (gemini_result and "error" not in gemini_result) else 0.0,
             "matched_snow": True,
             "gemini_result": gemini_result,
             "timestamp": now_iso,

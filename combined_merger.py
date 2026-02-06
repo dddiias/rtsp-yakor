@@ -5,6 +5,7 @@ import os
 import time
 import json
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -19,6 +20,84 @@ LOCAL_TZ = timezone(timedelta(hours=int(os.getenv("LOCAL_TZ_OFFSET_HOURS", "5"))
 
 def _now() -> datetime:
     return datetime.now(tz=LOCAL_TZ)
+
+
+def _extract_json_from_text(text: str, max_length: int = 200 * 1024) -> Optional[Dict[str, Any]]:
+    """
+    Надежное извлечение JSON из текста, который может содержать markdown, лишний текст, или JSON внутри строки.
+    
+    Стратегия:
+    1. Сначала ищем fenced code block ```json ... ```
+    2. Потом ищем первый валидный JSON-объект по стратегии: найти первую '{' и подобрать корректную закрывающую '}'
+       с учётом вложенности и строк (скобки внутри строк игнорировать).
+    3. Ограничиваем максимальную длину candidate, чтобы не съесть память.
+    """
+    if not text:
+        return None
+    
+    # Ограничиваем длину входного текста
+    if len(text) > max_length:
+        text = text[:max_length]
+    
+    # Шаг 1: Ищем fenced code block ```json ... ```
+    json_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+    matches = re.finditer(json_block_pattern, text, re.DOTALL | re.IGNORECASE)
+    for match in matches:
+        candidate = match.group(1).strip()
+        if candidate:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    
+    # Шаг 2: Ищем первый валидный JSON-объект
+    # Находим все позиции открывающих скобок
+    start_positions = []
+    for i, char in enumerate(text):
+        if char == '{':
+            start_positions.append(i)
+    
+    # Пробуем каждый кандидат, начиная с первого '{'
+    for start_pos in start_positions:
+        # Ограничиваем длину candidate
+        candidate_text = text[start_pos:start_pos + max_length]
+        
+        # Подбираем корректную закрывающую '}' с учётом вложенности и строк
+        depth = 0
+        in_string = False
+        escape_next = False
+        end_pos = -1
+        
+        for i, char in enumerate(candidate_text):
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\':
+                escape_next = True
+                continue
+            
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            
+            if not in_string:
+                if char == '{':
+                    depth += 1
+                elif char == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = start_pos + i + 1
+                        break
+        
+        if end_pos > 0:
+            candidate = text[start_pos:end_pos]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    
+    return None
 
 
 class EventMerger:
@@ -131,6 +210,7 @@ class EventMerger:
             "Region codes 01-18 only.\n"
             "Return plate WITHOUT spaces.\n"
             "If not sure => plate=null.\n\n"
+            "CRITICAL: Return ONLY valid JSON. No markdown. No explanations. Output must start with '{' and end with '}'.\n\n"
             "Return JSON:\n"
             "{\n"
             '  "snow_percentage": 42.5,\n'
@@ -158,19 +238,22 @@ class EventMerger:
             self._gemini_cache[ph] = (dict(result), now_ts)
             return result
 
-        # strip markdown
-        if text.startswith("```"):
-            t = text.strip("`").strip()
-            if t.lower().startswith("json"):
-                t = t[4:].strip()
-            text = t
+        # Логируем первые 300 символов (без бинарных данных)
+        preview_text = text[:300] if len(text) <= 300 else text[:300] + "..."
+        preview_text = ''.join(c if 32 <= ord(c) < 127 or c in '\n\r\t' else '.' for c in preview_text)
+        print(f"[GEMINI] Raw response preview: {preview_text}")
 
-        try:
-            data = json.loads(text)
-        except Exception as e:
+        # Используем надежное извлечение JSON
+        original_text = text
+        data = _extract_json_from_text(text)
+        
+        if data is None:
+            error_msg = "Failed to extract JSON from response"
+            print(f"[GEMINI] ERROR: {error_msg}")
+            print(f"[GEMINI] Failed response preview: {preview_text}")
             result = {
-                "error": f"JSON parse error: {e}",
-                "raw": (resp.text or "")[:400],
+                "error": error_msg,
+                "raw": original_text[:1000],  # Сохраняем первые 1000 символов
                 "snow_percentage": 0.0,
                 "snow_confidence": 0.0,
                 "plate": None,
@@ -178,6 +261,8 @@ class EventMerger:
             }
             self._gemini_cache[ph] = (dict(result), now_ts)
             return result
+        
+        print(f"[GEMINI] Gemini parsed OK: snow={data.get('snow_percentage', 0.0)} conf={data.get('snow_confidence', 0.0)}")
 
         def clamp01(x: Any) -> float:
             try:
