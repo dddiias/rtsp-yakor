@@ -8,31 +8,42 @@ from typing import Any, Dict
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 
-# Загружаем переменные окружения из app.env
-try:
-    from dotenv import load_dotenv
+# Env loading:
+# - Local dev: load from .env / app.env if present
+# - Prod (Render): use Environment Variables only (no file lookup, no warnings)
+def _is_prod_env() -> bool:
+    # Render sets RENDER=true in runtime
+    if os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    env = os.getenv("ENV", "").strip().lower()
+    return env in ("prod", "production")
 
-    env_path = os.path.join(os.path.dirname(__file__), "app.env")
-    if os.path.exists(env_path):
-        load_dotenv(env_path, override=False)
-        print(f"[API] Loaded environment from: {env_path}")
-    else:
-        print(f"[API] WARNING: app.env not found at {env_path}, using system env vars")
-except ImportError:
-    print("[API] WARNING: python-dotenv not installed, using system env vars only")
 
-from combined_merger import init_merger  # должен быть у тебя
+def _try_load_dotenv() -> None:
+    if _is_prod_env():
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    base = os.path.dirname(__file__)
+    for fname in (".env", "app.env"):
+        p = os.path.join(base, fname)
+        if os.path.exists(p):
+            load_dotenv(p, override=False)
+            print(f"[API] Loaded environment from: {p}")
+            break
+
+
+_try_load_dotenv()
+
+from combined_merger import init_merger
 
 UPSTREAM_URL = os.getenv("UPSTREAM_URL", "https://snowops-anpr-service.onrender.com/api/v1/anpr/events")
-MERGE_WINDOW_SECONDS = int(os.getenv("MERGE_WINDOW_SECONDS", "20"))
-MERGE_TTL_SECONDS = int(os.getenv("MERGE_TTL_SECONDS", "50"))
 ENABLE_STREAM_PROCESSOR = os.getenv("ENABLE_STREAM_PROCESSOR", "true").strip().lower() == "true"
 
-merger = init_merger(
-    upstream_url=UPSTREAM_URL,
-    window_seconds=MERGE_WINDOW_SECONDS,
-    ttl_seconds=MERGE_TTL_SECONDS,
-)
+merger = init_merger(upstream_url=UPSTREAM_URL)
 
 
 @asynccontextmanager
@@ -64,8 +75,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Hikvision ANPR Wrapper (RTSP mode)",
-    description="RTSP: детекция пересечения линии + Gemini номер/снег + отправка upstream",
+    title="Hikvision RTSP -> LineCross -> Gemini -> Upstream",
+    description="RTSP: детекция пересечения линии грузовиком + Gemini номер/снег + отправка upstream",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -90,9 +101,11 @@ async def log_requests(request: Request, call_next):
         print(f"{'='*80}\n")
         raise
 
+
 @app.get("/")
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
+
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -116,13 +129,10 @@ def stream_status() -> Dict[str, Any]:
 
     return {
         "status": "initialized",
-        "running": (p._plate_thread is not None and p._plate_thread.is_alive()
-                    and p._snow_thread is not None and p._snow_thread.is_alive()
-                    and p._worker_thread is not None and p._worker_thread.is_alive()),
+        "running": p.is_running(),
         "plate_connected": _is_open(p.plate_cap),
         "snow_connected": _is_open(p.snow_cap),
-        "snow_buffer_size": len(p._snow_frame_buffer),
-        "use_ffmpeg_direct": p.use_ffmpeg_direct,
+        "snow_buffer_size": p.snow_buffer_size(),
     }
 
 

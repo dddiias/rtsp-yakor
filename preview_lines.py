@@ -15,12 +15,18 @@ import numpy as np
 def _load_env_vars() -> None:
     try:
         from dotenv import load_dotenv
-        env_path = os.path.join(os.path.dirname(__file__), "app.env")
-        if os.path.exists(env_path):
-            load_dotenv(env_path, override=False)
-            print(f"[PREVIEW] Loaded environment from: {env_path}")
+        script_dir = os.path.dirname(__file__)
+        app_env_path = os.path.join(script_dir, "app.env")
+        dot_env_path = os.path.join(script_dir, ".env")
+        
+        if os.path.exists(app_env_path):
+            load_dotenv(app_env_path, override=False)
+            print(f"[PREVIEW] Loaded environment from: {app_env_path}")
+        elif os.path.exists(dot_env_path):
+            load_dotenv(dot_env_path, override=False)
+            print(f"[PREVIEW] Loaded environment from: {dot_env_path}")
         else:
-            print(f"[PREVIEW] WARNING: app.env not found at {env_path}, using system env vars")
+            print(f"[PREVIEW] WARNING: app.env or .env not found at {script_dir}, using system env vars")
     except ImportError:
         print("[PREVIEW] WARNING: python-dotenv not installed, using system env vars only")
 
@@ -310,8 +316,9 @@ def main():
             else:
                 cv2.putText(vis2, "SELECTED", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-            stacked = np.vstack([vis1, vis2])
-            cv2.imshow("RTSP Preview (Plate top, Snow bottom)", stacked)
+            # "Tabs": show only selected stream in a single window
+            shown = vis1 if sel == 1 else vis2
+            cv2.imshow("RTSP Preview (press 1=PLATE, 2=SNOW)", shown)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):

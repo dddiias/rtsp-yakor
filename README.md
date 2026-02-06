@@ -5,8 +5,9 @@
 ## Поток обработки
 - `stream_processor.py` (запускается вместе с FastAPI `api.py`):
   1) Читает `PLATE_CAMERA_RTSP` и `SNOW_CAMERA_RTSP` через FFmpeg.
-  2) YOLOv8 (`yolov8n.pt`) детектит грузовики (car/truck) на каждом кадре (`STREAM_DETECTION_INTERVAL`).
-  3) Детектор пересечения наклонной линии (нормированные точки `*_LINE_X1/Y1/X2/Y2`, направление `*_LINE_DIRECTION`) срабатывает отдельно для plate и snow потоков.
+  2) YOLOv8 (`yolov8n.pt`) детектит грузовики (truck=7) не на каждом кадре, а каждые `STREAM_DETECTION_EVERY_N_FRAMES`.
+     Между запусками используется "удержание" последних детекций `DETS_HOLD_SECONDS`, чтобы не моргало и трекер не разваливался.
+  3) Детектор пересечения наклонной линии работает по номерной камере (plate): линия задаётся `PLATE_LINE_*`.
   4) При пересечении сохраняются кадры (в память), вызывается Gemini с двумя фото: `snow_snapshot` + `plate_snapshot`.
   5) Формируется `event` и отправляется на `UPSTREAM_URL` как multipart (`event` JSON строкой + файлы `photos`).
 - `api.py` — FastAPI (эндпоинты `/health`, вспомогательные), поднимает `stream_processor` при `ENABLE_STREAM_PROCESSOR=true`.
@@ -27,6 +28,9 @@
   - (Если есть другие кропы — также под ключом `photos`)
 
 ## Ключевые переменные окружения (`app.env`)
+В проде на Render **файл `app.env` не нужен**: переменные задаются как **Environment Variables** (секреты).
+Файл `app.env`/`.env` — только для локальной разработки.
+
 ```
 UPSTREAM_URL=...
 PLATE_CAMERA_ID=shahovskoye
@@ -41,23 +45,20 @@ PLATE_LINE_X2=1.000
 PLATE_LINE_Y2=0.600
 PLATE_LINE_DIRECTION=down   # up/down/left/right/any
 
-SNOW_LINE_X1=0.000
-SNOW_LINE_Y1=0.875
-SNOW_LINE_X2=1.000
-SNOW_LINE_Y2=0.600
-SNOW_LINE_DIRECTION=down
-
 # Детект и трекинг
-STREAM_DETECTION_INTERVAL=1
+STREAM_DETECTION_EVERY_N_FRAMES=5
+DETS_HOLD_SECONDS=1.5
 STREAM_MIN_CONFIDENCE=0.28
 STREAM_MIN_BBOX_AREA=3000
-TRACK_MIN_HITS=1
-TRACK_IOU_THRESHOLD=0.25
+CROSS_EVENT_COOLDOWN_S=2.0
 
 FFMPEG_OUT_W=1920
 FFMPEG_OUT_H=1080
-USE_FFMPEG_DIRECT=true
-FFMPEG_BIN=.../ffmpeg.exe
+FFMPEG_INPUT_FPS=6
+# По умолчанию в проде лучше глушить спам ffmpeg "error while decoding MB ..."
+FFMPEG_LOGLEVEL=fatal
+# Включать только для диагностики:
+# LOG_FFMPEG_STDERR=true
 
 GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-2.5-flash
@@ -77,7 +78,7 @@ python -m uvicorn api:app --host 0.0.0.0 --port 8000
 Логи в консоли: `Plate crossing ...`, `Snow crossing ...`, `Gemini result ...`, `Upstream: status=...`.
 
 ## Линии и предпросмотр
-- `preview_lines.py` — показывает две камеры (plate сверху, snow снизу), позволяет двигать наклонные линии:
+- `preview_lines.py` — показывает две камеры (переключение 1/2 как "вкладки"), позволяет двигать наклонные линии:
   - `1/2` выбор линии, `TAB/C` выбор точки A/B, `WASD` мелкий шаг, `IJKL` крупный, `R` перечитать `app.env`.
   - После закрытия выводит координаты для `app.env`.
 
